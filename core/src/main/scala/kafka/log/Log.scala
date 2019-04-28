@@ -333,10 +333,15 @@ class Log(@volatile var dir: File,
    * not eligible for deletion. This means that the active segment is only eligible for deletion if the high watermark
    * equals the log end offset (which may never happen for a partition under consistent load). This is needed to
    * prevent the log start offset (which is exposed in fetch responses) from getting ahead of the high watermark.
+   *
+   * <p> 保持追踪当前的 high watermark 为的是确保 offsets 位于或者高于它的 segments 不会被删除。
+   * <p> 这意味着只有当 high watermark 在等于 log 结束 offset 的时候，活跃的 segment 才适合被删除，对于一个持续在写入的分区这种
+   *     情况可能永远不会发生。
+   * <p> 这可以阻止 log 起始 offset 超过 high watermark。
    */
   @volatile private var replicaHighWatermark: Option[Long] = None
 
-  /* the actual segments of the log */
+  /* the actual segments of the log 当前分区的全部 segments */
   private val segments: ConcurrentNavigableMap[java.lang.Long, LogSegment] =
     new ConcurrentSkipListMap[java.lang.Long, LogSegment]
 
@@ -1775,6 +1780,9 @@ class Log(@volatile var dir: File,
     * Delete any log segments matching the given predicate function,
     * starting with the oldest segment and moving forward until a segment doesn't match.
     *
+    * <p> 删除符合给定谓词函数的 log segments。
+    * <p> 删除时从最老的 segment 开始，直至某个不满足谓词的 segment 停止。
+    *
     * @param predicate A function that takes in a candidate log segment and the next higher segment
     *                  (if there is one) and returns true iff it is deletable
     * @return The number of segments deleted
@@ -1793,6 +1801,11 @@ class Log(@volatile var dir: File,
     }
   }
 
+  /**
+    * 删除给定的 segments
+    * @param deletable
+    * @return
+    */
   private def deleteSegments(deletable: Iterable[LogSegment]): Int = {
     maybeHandleIOException(
       s"Error while deleting segments for $topicPartition in dir ${dir.getParent}"
@@ -1801,8 +1814,10 @@ class Log(@volatile var dir: File,
       if (numToDelete > 0) {
         // we must always have at least one segment, so if we are going to delete all the segments, create a new one first
         if (segments.size == numToDelete)
+          // 每个分区必须至少存在一个 segment，所以如果全部 segments 都满足被删除条件的时候，我们要创建一个新 segment。
           roll()
         lock synchronized {
+          // 从 segments map 同步的删除 deletable 中每个 segment 对应的数据项，然后异步地删除 deletable 中每个 segment 对应的文件
           checkIfMemoryMappedBufferClosed()
           // remove the segments for lookups
           deletable.foreach(deleteSegment)
@@ -1821,9 +1836,13 @@ class Log(@volatile var dir: File,
     *
     * A final segment that is empty will never be returned (since we would just end up re-creating it).
     *
+    * <p> 从最老的 segment 开始遍历，直至某个 segment 不满足用户指定的谓词函数或者遍历到了包含当前 high watermark 的 segment。
+    * <p> 我们不删除偏移量位于或者超过 high watermark 的 segments，这样是为了确保分区的起始偏移量不会超过它。如果高水位没有被初始化，
+    *     就没有 segments 适于被删除。
+    * <p> 如果一个 segment 为空，那么它不会被删除；否则我们还要重新创建它。
     * @param predicate A function that takes in a candidate log segment and the next higher segment
     *                  (if there is one) and returns true iff it is deletable
-    * @return the segments ready to be deleted
+    * @return the segments ready to be deleted 返回适合被删除的 segments
     */
   private def deletableSegments(
     predicate: (LogSegment, Option[LogSegment]) => Boolean
@@ -1835,9 +1854,12 @@ class Log(@volatile var dir: File,
       val deletable = ArrayBuffer.empty[LogSegment]
       var segmentEntry = segments.firstEntry
       while (segmentEntry != null) {
+        // 遍历，获取当前 segment
         val segment = segmentEntry.getValue
+        // 获取下个 segment
         val nextSegmentEntry = segments.higherEntry(segmentEntry.getKey)
         val (nextSegment, upperBoundOffset, isLastSegmentAndEmpty) =
+          // 如果下个 segment 存在，则将其 offset 下界作为当前 segment offset 的上界
           if (nextSegmentEntry != null)
             (
               nextSegmentEntry.getValue,
@@ -1845,8 +1867,13 @@ class Log(@volatile var dir: File,
               false
             )
           else
+            // 如果下个 segment 不存在，则将即将被追加到当前分区的下个 message 的 offset 作为当前 segment offset 的上界
             (null, logEndOffset, segment.size == 0)
 
+        /**
+          * 如果 high watermark 不位于当前 segment 中 && 当前 segment 满足谓词函数 && 当前 segment 不是最后一个且不为空，
+          * 则当前 segment 可以被删除。
+          */
         if (highWatermark >= upperBoundOffset && predicate(
               segment,
               Option(nextSegment)
@@ -1894,6 +1921,7 @@ class Log(@volatile var dir: File,
     // 如果没有配置 retention.bytes 或者当前分区日志大小小于 retention.bytes，则不进行处理。
     if (config.retentionSize < 0 || size < config.retentionSize) return 0
     var diff = size - config.retentionSize
+    // segment 大小不超过 diff 时才符合被删除条件
     def shouldDelete(segment: LogSegment,
                      nextSegmentOpt: Option[LogSegment]) = {
       if (diff - segment.size >= 0) {
@@ -1904,12 +1932,17 @@ class Log(@volatile var dir: File,
       }
     }
 
+    // 从最老的 segment 开始遍历，找到满足条件的 segments 并进行删除
     deleteOldSegments(
       shouldDelete,
       reason = s"retention size in bytes ${config.retentionSize} breach"
     )
   }
 
+  /**
+    * 如果分区起始 offset 大于某个 segment 的上界 offset，那么该 segment 就可以删除
+    * @return
+    */
   private def deleteLogStartOffsetBreachedSegments(): Int = {
     def shouldDelete(segment: LogSegment, nextSegmentOpt: Option[LogSegment]) =
       nextSegmentOpt.exists(_.baseOffset <= logStartOffset)
@@ -1934,6 +1967,7 @@ class Log(@volatile var dir: File,
 
   /**
     * The offset of the next message that will be appended to the log
+    * <p> 将被追加到当前分区的下个 message 的 offset
     */
   def logEndOffset: Long = nextOffsetMetadata.messageOffset
 
@@ -2325,6 +2359,14 @@ class Log(@volatile var dir: File,
     * This method does not need to convert IOException to KafkaStorageException because it is either called before all logs are loaded
     * or the immediate caller will catch and handle IOException
     *
+    * <p> 该方法会异步地删除给定的 segment：
+    * <ol>
+    *   <li> 先从 segments map 将其删除，避免再被使用
+    *   <li> 通过在 .log 文件、.index 文件、.timeindex 文件后面增加 .deleted 重命名 segment 对应的文件名
+    *   <li> 调度异步的删除任务
+    * </ol>
+    * <p> 删除过程允许在无同步措施进行并发读操作，而且在并发读期间可以确保文件不会被物理删除。
+    * <p> 由于该方法要么在全部日志被加载前调用，要么是直接调用者会主动捕获并处理 IO 异常，所以该方法不会把 IOException 转换为 KafkaStorageException。
     * @param segment The log segment to schedule for deletion
     */
   private def deleteSegment(segment: LogSegment) {
@@ -2345,18 +2387,24 @@ class Log(@volatile var dir: File,
     * This method does not need to convert IOException (thrown from changeFileSuffixes) to KafkaStorageException because
     * it is either called before all logs are loaded or the caller will catch and handle IOException
     *
-    * @throws IOException if the file can't be renamed and still exists
+    * <p> 用于异步地删除给定的文件。
+    * <p> 该方法假设给定的文件存在，而且该方法并不是线程安全的。
+    * <p>
+    * @throws IOException if the file can't be renamed and still exists 如果调用者给定的文件无法进行重命名或者不存在的时候
     */
   private def asyncDeleteSegment(segment: LogSegment) {
+    // 修改要删除的 segment 对应的文件的后缀，在后缀增加一个 ".deleted"
     segment.changeFileSuffixes("", Log.DeletedFileSuffix)
     def deleteSeg() {
       info(s"Deleting segment ${segment.baseOffset}")
       maybeHandleIOException(
         s"Error while deleting segments for $topicPartition in dir ${dir.getParent}"
       ) {
+        // 从文件系统删除 segment 对应的全部文件（包括日志内容文件和索引文件等等）
         segment.deleteIfExists()
       }
     }
+    // 将 segment 对应的删除任务加入到调度中
     scheduler.schedule(
       "delete-file",
       deleteSeg _,
